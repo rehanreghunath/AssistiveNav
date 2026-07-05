@@ -5,10 +5,6 @@ object FlowBridge {
         System.loadLibrary("assistivenav")
     }
 
-    /** Create the C++ FlowEngine, GridAnalyzer, and ImuFusion.
-     *  Call once when the camera resolution is known.
-     *  After this returns, call [nativeSetFocalLength] with the real lens data
-     *  before the first camera frame is submitted. */
     external fun nativeInit(width: Int, height: Int)
 
     // ── Issue 5: runtime focal length calibration ──────────────────────────
@@ -27,7 +23,7 @@ object FlowBridge {
      * Call once from the main thread after [nativeInit] and before the first
      * camera frame.  Values outside [100, 5000] px are silently ignored.
      *
-     * @param focalLengthPx  f_mm × (image_width_px / sensor_width_mm)
+     * @param focalLengthPx  f_mm * (image_width_px / sensor_width_mm)
      */
     external fun nativeSetFocalLength(focalLengthPx: Float)
 
@@ -35,7 +31,7 @@ object FlowBridge {
      * Deliver a rotation-vector sensor event to the IMU fusion layer.
      *
      * Call this from your SensorEventListener on every TYPE_ROTATION_VECTOR
-     * event.  Pass [event.values] directly — the array is [x, y, z, w] (unit
+     * event.  Pass [event.values] directly -> the array is [x, y, z, w] (unit
      * quaternion) and may optionally carry a 5th element (heading accuracy)
      * which is ignored by the native side.
      *
@@ -65,28 +61,9 @@ object FlowBridge {
     /** Returns the RGBA overlay for the last processed frame, or null if not ready. */
     external fun nativeGetRgbaFrame(): ByteArray?
 
-    /**
-     * Returns per-cell grid analysis for the last processed frame (IMU-compensated).
-     *
-     * Layout — 48 floats flat (unchanged):
-     *   Indices 0..44 — 9 cells × 5 floats, row-major [0]=top-left [8]=bottom-right
-     *     [base+0]  meanMag      (px/frame)
-     *     [base+1]  meanAngle    (radians, −π..π)
-     *     [base+2]  dangerScore  (0..1) — now includes temporal-anomaly boost (issue 2)
-     *     [base+3]  ttc          (frames; 0 = no motion)
-     *     [base+4]  sampleCount  (cast to float)
-     *   Index 45 — foeX      (normalised 0..1) — now RANSAC-estimated (issue 1)
-     *   Index 46 — foeY      (normalised 0..1)
-     *   Index 47 — foeValid  (1.0 = valid, 0.0 = not available)
-     *
-     * Primary danger zone: cells [4] (centre-middle) and [7] (centre-bottom).
-     * Returns null on the first frame or before nativeInit.
-     */
     external fun nativeGetGridResult(): FloatArray?
 
-    /** Set the clockwise rotation (0/90/180/270) for the RGBA overlay. */
+    external fun nativeGetPtamPointCount(): Int
     external fun nativeSetRenderRotation(degrees: Int)
-
-    /** Release all native resources.  Call from Activity.onDestroy(). */
     external fun nativeDestroy()
 }

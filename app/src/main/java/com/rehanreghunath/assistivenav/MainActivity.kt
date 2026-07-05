@@ -55,10 +55,6 @@ class MainActivity : AppCompatActivity() {
         private const val IMU_DELAY        = SensorManager.SENSOR_DELAY_GAME
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Lifecycle
-    // ─────────────────────────────────────────────────────────────────────────
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -94,9 +90,6 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor.shutdown()
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Pipeline control
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun onToggle() {
         if (isRunning) stopPipeline()
@@ -134,30 +127,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Focal length calibration  — issue 5
-    //
-    //  Reads the real physical focal length from CameraCharacteristics and
-    //  converts it to pixels using the known sensor size and image resolution.
-    //
-    //  Formula:
-    //    f_px = f_mm × (image_width_px / sensor_width_mm)
-    //
-    //  This is the standard "thin lens" approximation; it is exact for a
-    //  rectilinear (non-fisheye) lens with no distortion correction.
-    //  CameraX applies distortion correction by default on API 28+, so this
-    //  value is a very close approximation even without explicit undistortion.
-    //
-    //  Returns null if the characteristics cannot be read (emulator, no camera2
-    //  support).  In that case the native fallback of 500 px is used.
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun computeFocalLengthPx(imageWidthPx: Int): Float? {
         return try {
             val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
 
             // Find the first back-facing logical camera, which is what CameraX
-            // selects via CameraSelector.DEFAULT_BACK_CAMERA.
+            // selects via CameraSelector.DEFAULT_BACK_CAMERA
             val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
                 cameraManager.getCameraCharacteristics(id)
                     .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
@@ -165,17 +141,17 @@ class MainActivity : AppCompatActivity() {
 
             val chars = cameraManager.getCameraCharacteristics(cameraId)
 
-            // Physical focal length in millimetres.
-            // Index 0 is the only element on most phones (fixed focal length).
+            // Physical focal length in millimetres
+            // Index 0 is the only element on most phones (fixed focal length)
             val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
             val fMm = focalLengths?.firstOrNull() ?: return null
 
-            // Physical sensor dimensions in millimetres.
+            // Physical sensor dimensions in millimetres
             val sensorSize: SizeF = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
                 ?: return null
             val sensorWidthMm = sensorSize.width
 
-            // Convert to pixels.
+            // Convert to pixels
             val fPx = fMm * imageWidthPx.toFloat() / sensorWidthMm
 
             Log.i(TAG, "Focal length: %.2f mm, sensor width: %.2f mm → %.1f px (at %d px wide)"
@@ -187,10 +163,6 @@ class MainActivity : AppCompatActivity() {
             null
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Camera
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
@@ -230,10 +202,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Frame analysis
-    // ─────────────────────────────────────────────────────────────────────────
-
     private inner class FrameAnalyzer : ImageAnalysis.Analyzer {
         private var yBuffer: ByteArray? = null
         private var bitmap: android.graphics.Bitmap? = null
@@ -264,10 +232,8 @@ class MainActivity : AppCompatActivity() {
                 if (!pipelineInitialized) {
                     FlowBridge.nativeInit(w, h)
 
-                    // ── Issue 5: pass real focal length before first frame ────
                     // computeFocalLengthPx() accesses CameraCharacteristics on
-                    // the camera executor thread.  This is safe — it reads
-                    // read-only hardware metadata and is not UI work.
+                    // the camera executor thread
                     val fPx = computeFocalLengthPx(w)
                     if (fPx != null) {
                         FlowBridge.nativeSetFocalLength(fPx)
@@ -314,12 +280,15 @@ class MainActivity : AppCompatActivity() {
                     val d4str   = if (danger4 != null) "%.2f".format(danger4) else "--"
                     val d7str   = if (danger7 != null) "%.2f".format(danger7) else "--"
 
+                    val ptamPts  = FlowBridge.nativeGetPtamPointCount()
+                    val mapMode  = if (ptamPts >= 10) "3D[$ptamPts]" else "2D[${ptamPts}]"
+
                     runOnUiThread {
                         if (isRunning) {
                             binding.flowView.setImageBitmap(bmp)
                             binding.flowView.visibility = android.view.View.VISIBLE
                             binding.debugText.text =
-                                "FPS: $fpsDisplay  |  Tracked: $tracked / $total\n" +
+                                "FPS: $fpsDisplay  |  Tracked: $tracked / $total  |  $mapMode\n" +
                                         "Danger  mid: $d4str  fwd: $d7str"
                         }
                     }
@@ -334,10 +303,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Permissions
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun hasCameraPermission() =
         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==

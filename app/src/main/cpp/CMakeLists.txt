@@ -12,7 +12,8 @@ add_compile_options(
     -fvisibility=hidden
 )
 
-find_package(OpenCV REQUIRED core imgproc video)
+# calib3d is now required for solvePnPRansac and triangulatePoints.
+find_package(OpenCV REQUIRED core imgproc video calib3d)
 
 if(NOT DEFINED OPENAL_DIR)
     message(FATAL_ERROR
@@ -27,11 +28,14 @@ set_target_properties(openal PROPERTIES
 
 add_library(assistivenav SHARED
     FlowEngine.cpp
-    GridAnalyzer.cpp      # 3×3 per-cell danger metrics and FOE estimation
+    GridAnalyzer.cpp
     FlowClassifier.cpp
-    ImuFusion.cpp         # rotation-vector compensation
-    ObstacleTracker.cpp   # blob clustering and temporal obstacle tracking
-    AudioEngine.cpp       # OpenAL-Soft HRTF spatial audio
+    ImuFusion.cpp
+    ObstacleTracker.cpp
+    AudioEngine.cpp
+    PTAMSystem.cpp      # tracking + background mapping
+    VoxelMap.cpp        # 3-D occupancy grid
+    SoundMapper.cpp     # voxel clusters → audio descriptors
     jni_bridge.cpp
 )
 

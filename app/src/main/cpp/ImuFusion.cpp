@@ -17,51 +17,34 @@ namespace assistivenav {
               mReadIdx(0),
               mHasData(false),
               mPrevTimestampNs(0),
-              mHasPrev(false)
+              mHasPrev(false),
+              mHasInitialQuat(false)
     {
         mSlot[0] = {0.0f, 0.0f, 0.0f, 1.0f};
         mSlot[1] = {0.0f, 0.0f, 0.0f, 1.0f};
-        mPrevQuat = {0.0f, 0.0f, 0.0f, 1.0f};
-
-        LOGI("Created for %dx%d, focal length %.0f px (fallback — call setFocalLength to override)",
+        mPrevQuat    = {0.0f, 0.0f, 0.0f, 1.0f};
+        mInitialQuat = {0.0f, 0.0f, 0.0f, 1.0f};
+        LOGI("Created for %dx%d, focal length %.0f px (fallback)",
              mWidth, mHeight, mFocalLengthPx);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  setFocalLength  — issue 5
-    //
-    //  Replaces the compile-time constant with a value computed from real
-    //  CameraCharacteristics data:
-    //    f_px = f_mm × (image_width_px / sensor_width_mm)
-    //
-    //  This should be called once from the main thread after nativeInit, before
-    //  the camera stream begins.  Race safety: the camera executor thread has
-    //  not started yet when this is called.
-    // ─────────────────────────────────────────────────────────────────────────
-
     void ImuFusion::setFocalLength(float focalLengthPx) {
         if (focalLengthPx < kMinPlausibleFx || focalLengthPx > kMaxPlausibleFx) {
-            LOGW("setFocalLength: %.1f px is outside plausible range [%.0f, %.0f]; "
-                 "keeping fallback %.0f px",
-                 focalLengthPx, kMinPlausibleFx, kMaxPlausibleFx, mFocalLengthPx);
+            LOGW("setFocalLength: %.1f px out of range — keeping fallback", focalLengthPx);
             return;
         }
         mFocalLengthPx = focalLengthPx;
-        LOGI("Focal length set to %.1f px (was %.1f px fallback)",
-             mFocalLengthPx, kFallbackFocalLengthPx);
+        LOGI("Focal length set to %.1f px", mFocalLengthPx);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Quaternion helpers
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── Quaternion helpers ────────────────────────────────────────────────────
 
-    ImuFusion::Quaternion ImuFusion::multiplyQuat(const Quaternion& a,
-                                                  const Quaternion& b) {
+    ImuFusion::Quaternion ImuFusion::multiplyQuat(const Quaternion& a, const Quaternion& b) {
         return {
-                a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-                a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-                a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+                a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
         };
     }
 
@@ -75,9 +58,28 @@ namespace assistivenav {
         const float xy = x*y, xz = x*z, yz = y*z;
         const float wx = w*x, wy = w*y, wz = w*z;
 
-        out[0] = 1.0f - 2.0f*(yy+zz); out[1] = 2.0f*(xy-wz);        out[2] = 2.0f*(xz+wy);
-        out[3] = 2.0f*(xy+wz);         out[4] = 1.0f - 2.0f*(xx+zz); out[5] = 2.0f*(yz-wx);
-        out[6] = 2.0f*(xz-wy);         out[7] = 2.0f*(yz+wx);        out[8] = 1.0f - 2.0f*(xx+yy);
+        out[0] = 1.f-2.f*(yy+zz); out[1] = 2.f*(xy-wz);     out[2] = 2.f*(xz+wy);
+        out[3] = 2.f*(xy+wz);     out[4] = 1.f-2.f*(xx+zz); out[5] = 2.f*(yz-wx);
+        out[6] = 2.f*(xz-wy);     out[7] = 2.f*(yz+wx);     out[8] = 1.f-2.f*(xx+yy);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  getRotationMatrix
+    //
+    //  Returns R_relative = q_current * conj(q_initial) as a rotation matrix.
+    //  This gives the camera orientation relative to session start, which is
+    //  the correct world frame for PTAM (identity at time 0).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    bool ImuFusion::getRotationMatrix(float outR[9]) const {
+        if (!mHasData.load(std::memory_order_acquire) || !mHasInitialQuat)
+            return false;
+
+        const Quaternion curr = mSlot[mReadIdx.load(std::memory_order_acquire)];
+        // Relative rotation: how much has the device rotated since session start?
+        const Quaternion rel  = multiplyQuat(curr, conjugateQuat(mInitialQuat));
+        quatToRotMat(rel, outR);
+        return true;
     }
 
     void ImuFusion::predictedDisplacement(const float H[9],
@@ -88,17 +90,14 @@ namespace assistivenav {
         const float hy = H[3]*px + H[4]*py + H[5];
         const float hw = H[6]*px + H[7]*py + H[8];
 
-        if (std::abs(hw) < 1e-6f) {
-            outDx = outDy = 0.0f;
-            return;
-        }
+        if (std::abs(hw) < 1e-6f) { outDx = outDy = 0.0f; return; }
         const float invW = 1.0f / hw;
         outDx = hx * invW - px;
         outDy = hy * invW - py;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  updateRotation  — sensor thread
+    //  updateRotation  — sensor thread (unchanged logic, adds initial quat)
     // ─────────────────────────────────────────────────────────────────────────
 
     void ImuFusion::updateRotation(float qx, float qy, float qz, float qw,
@@ -106,29 +105,22 @@ namespace assistivenav {
         const float norm = std::sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
         if (norm < 1e-6f) return;
 
-        const float invN     = 1.0f / norm;
-        const int   writeSlot = 1 - mReadIdx.load(std::memory_order_relaxed);
-        mSlot[writeSlot] = {qx*invN, qy*invN, qz*invN, qw*invN};
+        const float invN    = 1.0f / norm;
+        const int writeSlot = 1 - mReadIdx.load(std::memory_order_relaxed);
+        mSlot[writeSlot]    = {qx*invN, qy*invN, qz*invN, qw*invN};
         mReadIdx.store(writeSlot, std::memory_order_release);
         mHasData.store(true,      std::memory_order_release);
+
+        // Record the very first valid quaternion as the session-start reference.
+        // All subsequent getRotationMatrix() calls return the delta from this.
+        if (!mHasInitialQuat) {
+            mInitialQuat    = mSlot[writeSlot];
+            mHasInitialQuat = true;
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  compensate  — camera executor thread
-    //
-    //  Subtracts rotation-induced displacement from every flow vector, then
-    //  stores the estimated angular velocity for AudioEngine to read.
-    //
-    //  Angular velocity derivation:
-    //    qDelta.w = cos(θ/2)  where θ is the rotation angle over one frame.
-    //    Clamping |w| to [0,1] before acos guards against floating-point
-    //    values slightly outside this range (numerical artifact).
-    //    ω = θ × kAssumedFrameHz converts angle/frame to rad/s.
-    //
-    //  This approach avoids adding a second sensor stream (TYPE_GYROSCOPE)
-    //  and uses the already-fused, filtered rotation-vector data that
-    //  ImuFusion processes anyway.  Accuracy is sufficient for threshold
-    //  comparisons; we do not need a calibrated gyroscope measurement.
+    //  compensate  — camera executor thread (unchanged from prior version)
     // ─────────────────────────────────────────────────────────────────────────
 
     void ImuFusion::compensate(FlowResult& result) {
@@ -138,67 +130,51 @@ namespace assistivenav {
                 mSlot[mReadIdx.load(std::memory_order_acquire)];
 
         if (!mHasPrev) {
-            mPrevQuat             = currQuat;
-            mHasPrev              = true;
-            mLastAngVelRadPerSec  = 0.0f;
+            mPrevQuat            = currQuat;
+            mHasPrev             = true;
+            mLastAngVelRadPerSec = 0.0f;
             return;
         }
 
         const Quaternion qDelta = multiplyQuat(currQuat, conjugateQuat(mPrevQuat));
 
-        // ── Estimate angular velocity for the audio suppression gate ──────────
-        // qDelta.w ≈ 1 means near-zero rotation; lower values mean more
-        // rotation.  Converting to an angle and scaling by frame rate gives
-        // rad/s, which AudioEngine can compare against its rotation thresholds.
         {
-            const float halfAngle        = std::acos(
+            const float halfAngle    = std::acos(
                     std::clamp(std::abs(qDelta.w), 0.0f, 1.0f));
             mLastAngVelRadPerSec = halfAngle * 2.0f * kAssumedFrameHz;
         }
 
-        // w > 0.9999990 ↔ |rotation angle| < 0.05°.  Skip — pure numerical noise.
-        if (qDelta.w > 0.9999990f) {
-            mPrevQuat = currQuat;
-            return;
-        }
+        if (qDelta.w > 0.9999990f) { mPrevQuat = currQuat; return; }
 
         float R[9];
         quatToRotMat(qDelta, R);
 
-        // H = K · R · K⁻¹, analytically expanded.
-        // Now uses mFocalLengthPx (runtime-calibrated) instead of a constant.
         const float f    = mFocalLengthPx;
         const float cx   = static_cast<float>(mWidth)  * 0.5f;
         const float cy   = static_cast<float>(mHeight) * 0.5f;
         const float invF = 1.0f / f;
 
-        // R · K⁻¹
         float RKinv[9];
         for (int row = 0; row < 3; ++row) {
-            RKinv[row*3 + 0] =  R[row*3 + 0] * invF;
-            RKinv[row*3 + 1] =  R[row*3 + 1] * invF;
-            RKinv[row*3 + 2] = -R[row*3 + 0] * cx * invF
-                               - R[row*3 + 1] * cy * invF
-                               + R[row*3 + 2];
+            RKinv[row*3+0] =  R[row*3+0] * invF;
+            RKinv[row*3+1] =  R[row*3+1] * invF;
+            RKinv[row*3+2] = -R[row*3+0]*cx*invF - R[row*3+1]*cy*invF + R[row*3+2];
         }
 
-        // K · (R · K⁻¹)
         float H[9];
         for (int col = 0; col < 3; ++col) {
-            H[0*3 + col] = f   * RKinv[0*3 + col] + cx * RKinv[2*3 + col];
-            H[1*3 + col] = f   * RKinv[1*3 + col] + cy * RKinv[2*3 + col];
-            H[2*3 + col] =                                RKinv[2*3 + col];
+            H[0*3+col] = f   * RKinv[0*3+col] + cx * RKinv[2*3+col];
+            H[1*3+col] = f   * RKinv[1*3+col] + cy * RKinv[2*3+col];
+            H[2*3+col] =                              RKinv[2*3+col];
         }
 
         float magSum = 0.0f;
-
         for (FlowVector& fv : result.vectors) {
             float predDx, predDy;
             predictedDisplacement(H, fv.x0, fv.y0, cx, cy, predDx, predDy);
-
             fv.dx       -= predDx;
             fv.dy       -= predDy;
-            fv.magnitude = std::sqrt(fv.dx * fv.dx + fv.dy * fv.dy);
+            fv.magnitude = std::sqrt(fv.dx*fv.dx + fv.dy*fv.dy);
             fv.angle     = std::atan2(fv.dy, fv.dx);
             magSum      += fv.magnitude;
         }

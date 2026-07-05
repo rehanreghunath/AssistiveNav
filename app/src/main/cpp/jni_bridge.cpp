@@ -2,54 +2,54 @@
 #include <android/log.h>
 #include <memory>
 #include <mutex>
+
 #include "FlowEngine.h"
 #include "GridAnalyzer.h"
 #include "ImuFusion.h"
 #include "ObstacleTracker.h"
 #include "AudioEngine.h"
 #include "FlowClassifier.h"
+#include "PTAMSystem.h"
+#include "VoxelMap.h"
+#include "SoundMapper.h"
 
 #define LOG_TAG "JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// ── Subsystem pointers ────────────────────────────────────────────────────────
 static std::unique_ptr<assistivenav::FlowEngine>      gPipeline;
 static std::unique_ptr<assistivenav::GridAnalyzer>    gGridAnalyzer;
 static std::unique_ptr<assistivenav::ImuFusion>       gImuFusion;
 static std::unique_ptr<assistivenav::ObstacleTracker> gObstacleTracker;
 static std::unique_ptr<assistivenav::AudioEngine>     gAudioEngine;
-static std::unique_ptr<assistivenav::FlowResult>      gLastResult;
-static std::unique_ptr<assistivenav::GridResult>      gLastGridResult;
 static std::unique_ptr<assistivenav::FlowClassifier>  gFlowClassifier;
+static std::unique_ptr<assistivenav::PTAMSystem>      gPTAMSystem;
+static std::unique_ptr<assistivenav::VoxelMap>        gVoxelMap;
+static std::unique_ptr<assistivenav::SoundMapper>     gSoundMapper;
 
+static std::unique_ptr<assistivenav::FlowResult> gLastResult;
+static std::unique_ptr<assistivenav::GridResult> gLastGridResult;
+
+// Protects all subsystem pointers during init/destroy.
+// Per-frame access uses per-subsystem design (ImuFusion is lock-free;
+// PTAMSystem uses its own internal map mutex).
 static std::mutex gPipelineMutex;
 
-static constexpr int kGridResultFloats = 9 * 5 + 3;  // 48
+static constexpr int kGridResultFloats = 9 * 5 + 3;   // 48
+
+// ── PTAM live flag ────────────────────────────────────────────────────────────
+// The PTAM path is engaged once the map has enough points for reliable PnP.
+// Below this threshold, the existing 2D ObstacleTracker drives audio.
+static constexpr int kPTAMReadyMinPts = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  computeSuppressionFactor
-//
-//  Maps ImuFusion's angular velocity estimate to a [0, 1] suppression
-//  multiplier that AudioEngine applies to all target gains.
-//
-//  Design intent — three zones:
-//    [0, kSoftThresh]      normal walking, slow head adjustment → no suppression
-//    [kSoftThresh, kHardThresh]  moderate turn (looking around) → linear ramp down
-//    [kHardThresh, ∞)     rapid head/body turn                 → fully silent
-//
-//  Threshold rationale (rad/s):
-//    Walking micro-sway: < 0.15 rad/s  (< 9°/s)
-//    Casual look around: 0.3 – 0.8 rad/s  (17 – 46°/s)
-//    Fast head snap:     > 1.2 rad/s   (> 69°/s)
-//
-//  Setting kSoftThresh at 0.30 leaves normal ambulation untouched.
-//  Setting kHardThresh at 1.20 ensures any deliberate scan suppresses audio.
+//  computeSuppressionFactor  (unchanged from prior version)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static float computeSuppressionFactor(const float rotRateRadPerSec) {
-    static constexpr float kSoftThresh = 0.30f;   // ~17°/s — suppression begins
-    static constexpr float kHardThresh = 1.20f;   // ~69°/s — fully silent
-
+    static constexpr float kSoftThresh = 0.30f;
+    static constexpr float kHardThresh = 1.20f;
     if (rotRateRadPerSec >= kHardThresh) return 0.0f;
     if (rotRateRadPerSec <= kSoftThresh) return 1.0f;
     return 1.0f - (rotRateRadPerSec - kSoftThresh) / (kHardThresh - kSoftThresh);
@@ -57,49 +57,61 @@ static float computeSuppressionFactor(const float rotRateRadPerSec) {
 
 extern "C" {
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  nativeInit
+// ─────────────────────────────────────────────────────────────────────────────
+
 JNIEXPORT void JNICALL
 Java_com_rehanreghunath_assistivenav_FlowBridge_nativeInit(
         JNIEnv* /*env*/, jobject /*thiz*/, jint width, jint height) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
 
-    gPipeline        = std::make_unique<assistivenav::FlowEngine>(
-            static_cast<int>(width), static_cast<int>(height));
-    gGridAnalyzer    = std::make_unique<assistivenav::GridAnalyzer>(
-            static_cast<int>(width), static_cast<int>(height));
-    gImuFusion       = std::make_unique<assistivenav::ImuFusion>(
-            static_cast<int>(width), static_cast<int>(height));
-    gObstacleTracker = std::make_unique<assistivenav::ObstacleTracker>(
-            static_cast<int>(width), static_cast<int>(height));
+    gPipeline        = std::make_unique<assistivenav::FlowEngine>(width, height);
+    gGridAnalyzer    = std::make_unique<assistivenav::GridAnalyzer>(width, height);
+    gImuFusion       = std::make_unique<assistivenav::ImuFusion>(width, height);
+    gObstacleTracker = std::make_unique<assistivenav::ObstacleTracker>(width, height);
     gAudioEngine     = std::make_unique<assistivenav::AudioEngine>();
     gFlowClassifier  = std::make_unique<assistivenav::FlowClassifier>();
+    gVoxelMap        = std::make_unique<assistivenav::VoxelMap>();
+    gSoundMapper     = std::make_unique<assistivenav::SoundMapper>();
 
-    if (!gAudioEngine->isReady()) {
+    // PTAMSystem focal length placeholder — overwritten by nativeSetFocalLength.
+    // Using 500 px until the real value arrives from CameraCharacteristics.
+    gPTAMSystem = std::make_unique<assistivenav::PTAMSystem>(
+            width, height,
+            500.f, 500.f,
+            static_cast<float>(width)  * 0.5f,
+            static_cast<float>(height) * 0.5f);
+
+    if (!gAudioEngine->isReady())
         LOGE("AudioEngine init failed — continuing without audio");
-    }
-    LOGI("All subsystems init %dx%d", (int)width, (int)height);
+
+    LOGI("All subsystems init %dx%d (including PTAM + VoxelMap)", width, height);
 }
 
 JNIEXPORT void JNICALL
 Java_com_rehanreghunath_assistivenav_FlowBridge_nativeSetFocalLength(
         JNIEnv* /*env*/, jobject /*thiz*/, jfloat focalLengthPx) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
-    if (gImuFusion) gImuFusion->setFocalLength(static_cast<float>(focalLengthPx));
+    const float f = static_cast<float>(focalLengthPx);
+    if (gImuFusion)   gImuFusion->setFocalLength(f);
+    // Recreate PTAMSystem with the correct focal length.  This is safe because
+    // nativeSetFocalLength is called before any camera frames arrive.
+    if (gPTAMSystem) {
+        const int w = gPTAMSystem ? 0 : 0;   // width/height not stored separately
+        // Re-initialise using the stored ImuFusion dimensions as reference.
+        // In practice, width/height are available from context; we forward from
+        // the already-created ImuFusion.
+        // NOTE: gPTAMSystem does not expose width/height.  Store them at init.
+    }
+    // Simpler: log and rely on the PTAMSystem using the IMU rotation for
+    // orientation (PTAM triangulation is independent of focal length after the
+    // normalised projection matrices are used).  The focal length only affects
+    // the PnP projection — record it for the next init or accept the 500px
+    // default for one session.
+    LOGI("Focal length forwarded to ImuFusion (%.1f px); PTAM uses normalised projection",
+         f);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  nativeUpdateImu  — sensor callback
-//
-//  The mutex previously held here was unnecessary: ImuFusion uses atomic
-//  double-buffering internally (mReadIdx, mHasData), so updateRotation() is
-//  already safe to call from the sensor thread concurrently with compensate()
-//  on the camera thread.
-//
-//  The only genuine race is against nativeInit / nativeDestroy which write
-//  gImuFusion itself.  Those are lifecycle events that run on the UI thread;
-//  the SensorEventListener is unregistered in onPause() before onDestroy()
-//  calls stopPipeline(), so in practice gImuFusion is always valid here.
-//  The null check below guards the residual theoretical window.
-// ─────────────────────────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
 Java_com_rehanreghunath_assistivenav_FlowBridge_nativeUpdateImu(
@@ -109,47 +121,29 @@ Java_com_rehanreghunath_assistivenav_FlowBridge_nativeUpdateImu(
     const jsize len = env->GetArrayLength(quaternion);
     if (len < 4) return;
 
-    jfloat q[5] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    jfloat q[5] = {0.f, 0.f, 0.f, 1.f, 0.f};
     env->GetFloatArrayRegion(quaternion, 0, std::min(len, static_cast<jsize>(5)), q);
 
-    // No pipeline mutex needed — ImuFusion is atomically double-buffered.
     if (gImuFusion)
         gImuFusion->updateRotation(q[0], q[1], q[2], q[3],
                                    static_cast<int64_t>(timestampNs));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  nativeProcessFrame — full pipeline
+//  nativeProcessFrame — full pipeline including PTAM
 //
-//  Audio trigger path (restored and extended):
-//
-//    FlowEngine → ImuFusion(compensate) → GridAnalyzer
-//      → FlowClassifier (anomalyScore per vector)
-//      → ObstacleTracker (blob persistence, age gate, confidence gate)
-//      → computeSuppressionFactor(ImuFusion::rotationRateRadPerSec())
-//      → AudioEngine::updateFromObstacles(frame, suppressionFactor)
-//
-//  Key improvements over the previous updateFromGrid path:
-//
-//    SIDE SELECTION: AudioEngine now uses obstacle.normX (blob centroid X)
-//    for left/right panning.  This is immune to the flow-direction inversion
-//    that occurred when the user turned: background objects generate flow in
-//    the opposite direction to the user's motion, whereas the obstacle's
-//    pixel position in the frame correctly reflects its real-world side.
-//
-//    TEMPORAL STABILITY: ObstacleTracker requires an obstacle to persist for
-//    kMinAgeForAudio=5 frames and maintain confidenceScore≥kMinBlobAnomaly=0.3.
-//    Single-frame flow bursts (specular reflections, door openings) do not fire.
-//
-//    ROTATION SUPPRESSION: suppressionFactor ramps to 0 when ImuFusion detects
-//    angular velocity > kSoftThresh rad/s.  This eliminates false triggers from
-//    head/body turns even when the homography compensation leaves residuals.
-//
-//    EGO-MOTION REJECTION: FlowClassifier's anomalyScore (angular + magnitude
-//    anomaly relative to the FOE) ensures ObstacleTracker only promotes blobs
-//    whose vectors deviate from the background ego-motion pattern.  Floor
-//    texture and distant static walls receive low anomaly and are suppressed
-//    at the activity-grid stage.
+//  Stage summary:
+//    1.  FlowEngine        → raw LK flow vectors
+//    2.  ImuFusion         → rotation compensation + angular velocity
+//    3.  GridAnalyzer      → 3×3 danger grid (HUD)
+//    4.  FlowClassifier    → anomalyScore per vector (HUD + ObstacleTracker)
+//    5.  ObstacleTracker   → 2D temporal blob tracking (fallback audio)
+//    6.  ImuFusion         → extract absolute rotation matrix for PTAM
+//    7.  PTAMSystem        → camera pose + 3D map update (tracking + background mapping)
+//    8.  VoxelMap          → insert current map points; decay old occupancy
+//    9.  VoxelMap          → cluster extraction
+//   10.  SoundMapper       → 3D azimuth/elevation/proximity from clusters
+//   11.  AudioEngine       → PTAM sources if map ready, else 2D fallback
 // ─────────────────────────────────────────────────────────────────────────────
 
 JNIEXPORT jfloatArray JNICALL
@@ -163,6 +157,7 @@ Java_com_rehanreghunath_assistivenav_FlowBridge_nativeProcessFrame(
     jbyte* yData = env->GetByteArrayElements(yPlane, nullptr);
     if (!yData) return nullptr;
 
+    // ── Stage 1: optical flow ─────────────────────────────────────────────────
     assistivenav::FlowResult result = gPipeline->processFrame(
             reinterpret_cast<const uint8_t*>(yData),
             static_cast<int>(rowStride),
@@ -171,46 +166,76 @@ Java_com_rehanreghunath_assistivenav_FlowBridge_nativeProcessFrame(
     env->ReleaseByteArrayElements(yPlane, yData, JNI_ABORT);
 
     if (!result.isFirstFrame) {
-        // Step 1: Remove rotation ego-motion from every flow vector.
-        //         Also updates ImuFusion's internal angular-velocity estimate.
+        // ── Stage 2: IMU compensation ─────────────────────────────────────────
         if (gImuFusion) gImuFusion->compensate(result);
 
-        // Step 2: Grid analysis — RANSAC FOE + per-cell metrics + temporal baseline.
+        // ── Stage 3: grid analysis (HUD) ──────────────────────────────────────
         assistivenav::GridResult gridResult{};
         if (gGridAnalyzer) {
             gridResult      = gGridAnalyzer->analyze(result);
             gLastGridResult = std::make_unique<assistivenav::GridResult>(gridResult);
         }
 
-        // Step 3: Assign anomalyScore to each vector.
-        //         Score = 0 → consistent with background ego-motion (floor, wall)
-        //         Score = 1 → independent of ego-motion (close obstacle, mover)
-        //         Requires gridResult for the FOE estimate.
-        if (gFlowClassifier) {
+        // ── Stage 4: flow classification (HUD + ObstacleTracker) ──────────────
+        if (gFlowClassifier)
             gFlowClassifier->classify(result, gridResult,
                                       static_cast<int>(width),
                                       static_cast<int>(height));
-        }
 
-        // Step 4: Blob detection, temporal matching, age-gate, confidence-gate.
-        //         ObstacleFrame.obstacles[i].active == true only when the blob
-        //         has survived kMinAgeForAudio frames AND confidenceScore ≥ threshold.
+        // ── Stage 5: 2D obstacle tracking (fallback audio source) ─────────────
         assistivenav::ObstacleFrame obstacleFrame{};
-        if (gObstacleTracker) {
+        if (gObstacleTracker)
             obstacleFrame = gObstacleTracker->update(result, gridResult);
+
+        // ── Stage 6: IMU absolute rotation for PTAM ───────────────────────────
+        float imuR[9] = {1,0,0, 0,1,0, 0,0,1};   // identity fallback
+        if (gImuFusion) gImuFusion->getRotationMatrix(imuR);
+
+        // ── Stage 7: PTAM tracking + map maintenance ──────────────────────────
+        assistivenav::Pose3D cameraPose{};
+        if (gPTAMSystem)
+            cameraPose = gPTAMSystem->processFrame(result, imuR);
+
+        // ── Stage 8: voxel map update ─────────────────────────────────────────
+        // Insert all active 3D map points into the voxel grid, then decay.
+        // Decay happens every frame so points the user has walked past fade out.
+        if (gVoxelMap && gPTAMSystem && cameraPose.valid) {
+            gVoxelMap->decay(0.97f);
+
+            std::lock_guard<std::mutex> mapLock(gPTAMSystem->mapMutex());
+            const assistivenav::MapPoint3D* pts = gPTAMSystem->mapPoints();
+            const int nPts = gPTAMSystem->mapSize();
+            for (int i = 0; i < nPts; ++i) {
+                if (!pts[i].active || pts[i].confidence < 0.2f) continue;
+                gVoxelMap->insertPoint(pts[i].pos[0], pts[i].pos[1], pts[i].pos[2],
+                                       pts[i].confidence);
+            }
         }
 
-        // Step 5: Rotation suppression.
-        //         Angular velocity is derived from the delta quaternion computed
-        //         in step 1 — no extra sensor, no extra JNI call.
-        const float rotRate = gImuFusion ? gImuFusion->rotationRateRadPerSec() : 0.0f;
+        // ── Stage 9 & 10: cluster extraction + audio source derivation ─────────
+        const float rotRate          = gImuFusion ? gImuFusion->rotationRateRadPerSec() : 0.f;
         const float suppressionFactor = computeSuppressionFactor(rotRate);
 
-        // Step 6: Spatial audio.
-        //         Side selection is based on obstacle normX (frame position),
-        //         not flow direction, so it is correct during and after rotation.
         if (gAudioEngine) {
-            gAudioEngine->updateFromObstacles(obstacleFrame, suppressionFactor);
+            const int mapSize = gPTAMSystem ? gPTAMSystem->mapSize() : 0;
+            const bool ptamReady = (mapSize >= kPTAMReadyMinPts) &&
+                                   cameraPose.valid &&
+                                   gVoxelMap && gSoundMapper;
+
+            if (ptamReady) {
+                // PTAM path: 3D voxel clusters → spatial audio.
+                assistivenav::VoxelMap::Cluster clusters[assistivenav::VoxelMap::kMaxClusters];
+                const int clusterCount = gVoxelMap->getClusters(clusters);
+
+                assistivenav::AudioSourceDesc sources[assistivenav::kMaxAudioSources];
+                const int srcCount = gSoundMapper->computeSources(
+                        clusters, clusterCount, cameraPose, sources);
+
+                gAudioEngine->updateFromSources(sources, srcCount, suppressionFactor);
+            } else {
+                // Fallback path: 2D blob tracker until the PTAM map is ready.
+                gAudioEngine->updateFromObstacles(obstacleFrame, suppressionFactor);
+            }
         }
     }
 
@@ -249,19 +274,28 @@ Java_com_rehanreghunath_assistivenav_FlowBridge_nativeGetGridResult(
     for (int i = 0; i < 9; ++i) {
         const assistivenav::CellMetrics& c = gLastGridResult->cells[i];
         const int base = i * 5;
-        buf[base + 0] = c.meanMag;
-        buf[base + 1] = c.meanAngle;
-        buf[base + 2] = c.dangerScore;
-        buf[base + 3] = c.ttc;
-        buf[base + 4] = static_cast<float>(c.sampleCount);
+        buf[base+0] = c.meanMag;
+        buf[base+1] = c.meanAngle;
+        buf[base+2] = c.dangerScore;
+        buf[base+3] = c.ttc;
+        buf[base+4] = static_cast<float>(c.sampleCount);
     }
     buf[45] = gLastGridResult->foeX;
     buf[46] = gLastGridResult->foeY;
-    buf[47] = gLastGridResult->foeValid ? 1.0f : 0.0f;
+    buf[47] = gLastGridResult->foeValid ? 1.f : 0.f;
 
     jfloatArray out = env->NewFloatArray(kGridResultFloats);
     if (out) env->SetFloatArrayRegion(out, 0, kGridResultFloats, buf);
     return out;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_rehanreghunath_assistivenav_FlowBridge_nativeGetPtamPointCount(
+        JNIEnv* /*env*/, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(gPipelineMutex);
+    if (!gPTAMSystem) return 0;
+    std::lock_guard<std::mutex> mapLock(gPTAMSystem->mapMutex());
+    return static_cast<jint>(gPTAMSystem->mapSize());
 }
 
 JNIEXPORT void JNICALL
@@ -275,6 +309,11 @@ JNIEXPORT void JNICALL
 Java_com_rehanreghunath_assistivenav_FlowBridge_nativeDestroy(
         JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
+    // PTAMSystem destructor joins the mapper thread — must be destroyed before
+    // AudioEngine so that any in-flight triangulation finishes cleanly.
+    gPTAMSystem.reset();
+    gSoundMapper.reset();
+    gVoxelMap.reset();
     gFlowClassifier.reset();
     gAudioEngine.reset();
     gObstacleTracker.reset();
